@@ -1,0 +1,94 @@
+name: Build and Push Docker Image
+'on':
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      laya_version:
+        description: >-
+          Exact Laya version to freeze (leave blank to auto-detect latest from
+          PyPI)
+        required: false
+        type: string
+        default: ''
+permissions:
+  contents: read
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Determine Exact SemVer with Fallback
+        id: semver
+        run: |
+          # Modern input syntax handling
+          MANUAL_VERSION="${{ inputs.laya_version }}"
+
+          # CRITICAL FIX: Docker tags must be entirely lowercase.
+          # This forces uppercase GitHub usernames to lowercase automatically.
+          RAW_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+          LOWER_USERNAME=$(echo "$RAW_USERNAME" | tr '[:upper:]' '[:lower:]')
+          REPO="$LOWER_USERNAME/laya-service"
+
+          RESOLVED_VERSION=""
+
+          if [ -n "$MANUAL_VERSION" ]; then
+            echo "Using manually specified version: $MANUAL_VERSION"
+            RESOLVED_VERSION="$MANUAL_VERSION"
+          else
+            echo "Attempting to query PyPI API..."
+            # Tier 1: Query PyPI JSON API with a 5-second timeout
+            RESOLVED_VERSION=$(python -c "
+            import urllib.request, json
+            try:
+                req = urllib.request.Request('https://pypi.org/pypi/laya/json', headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as res:
+                    data = json.loads(res.read())
+                    print(data['info']['version'])
+            except Exception:
+                exit(1)
+            " 2>/dev/null || echo "")
+
+            # Tier 2: If PyPI JSON fails, try CLI pip index inspection
+            if [ -z "$RESOLVED_VERSION" ]; then
+              echo "PyPI API failed or timed out. Falling back to pip index..."
+              RESOLVED_VERSION=$(python -m pip index versions laya 2>/dev/null | grep -oP '(?<=laya \()[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || echo "")
+            fi
+          fi
+
+          # Tier 3: Emergency Fallback execution
+          if [ -n "$RESOLVED_VERSION" ]; then
+            echo "Successfully resolved Laya version: $RESOLVED_VERSION"
+            MAJOR_MINOR=$(echo "$RESOLVED_VERSION" | cut -d. -f1,2)
+
+            echo "version=$RESOLVED_VERSION" >> $GITHUB_OUTPUT
+            echo "tags=$REPO:$RESOLVED_VERSION,$REPO:$MAJOR_MINOR,$REPO:latest" >> $GITHUB_OUTPUT
+          else
+            echo "WARNING: Could not resolve exact version. Falling back to default 'latest'."
+            echo "version=" >> $GITHUB_OUTPUT
+            echo "tags=$REPO:latest" >> $GITHUB_OUTPUT
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: '${{ secrets.DOCKERHUB_USERNAME }}'
+          password: '${{ secrets.DOCKERHUB_TOKEN }}'
+      - name: Build and push versioned image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            LAYA_VERSION=${{ steps.semver.outputs.version }}
+          tags: '${{ steps.semver.outputs.tags }}'
+          cache-from: type=gha
+          cache-to: 'type=gha,mode=max'
