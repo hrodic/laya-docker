@@ -33,7 +33,8 @@ RUN mkdir -p /opt/models/huggingface
 ENV HF_HOME=/opt/models/huggingface
 
 # Pre-download and cache model weights into the isolated folder
-RUN python -c "from laya import Router; Router()"
+# Forces Laya to resolve the script detectors, download all 3 sub-checkpoints, and store them into /opt/models/huggingface making it 100% standalone.
+RUN python -c "from laya import Router; r = Router(); r.predict(state='warmup', questions={'q': {'type': 'noul', 'instructions': 'warmup'}})"
 
 # ==========================================
 # Stage 2: Minimal Distro Runtime
