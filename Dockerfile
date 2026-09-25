@@ -43,7 +43,7 @@ FROM python:3.11-slim AS runner
 LABEL org.opencontainers.image.title="laya-decision-service" \
       org.opencontainers.image.description="Non-autoregressive decision model microservice" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.documentation="https://github.com/convaiinnovations/laya"
+      org.opencontainers.image.documentation="https://github.com/NandhaKishorM/laya"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
