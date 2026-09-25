@@ -16,31 +16,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment and upgrade core tools for clean compilation
+# Create virtual environment and install wheels
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --upgrade pip setuptools wheel
 
-# Install dependencies conditionally
+# Upgrade pip during build so dependencies resolve cleanly
+RUN pip install --upgrade --no-cache-dir pip setuptools wheel
+
+# Install runtime dependencies
 RUN if [ -z "$LAYA_VERSION" ]; then \
         pip install --no-cache-dir laya onnxruntime uvicorn fastapi; \
     else \
         pip install --no-cache-dir "laya==${LAYA_VERSION}" onnxruntime uvicorn fastapi; \
     fi
 
-# FIX 1: Pre-download 100% of the repository (all subfolders & checkpoints)
-# Eliminates all runtime Hugging Face downloads without executing model code
+# Pre-download 100% of model checkpoints (air-gapped execution)
 RUN mkdir -p /opt/models/huggingface
 ENV HF_HOME=/opt/models/huggingface
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='convaiinnovations/laya')"
 
-# FIX 2: Strip packaging tooling and build artifacts from virtualenv
-RUN pip uninstall -y pip setuptools wheel 2>/dev/null || true
+# REMEDIATION: Thoroughly scrub all packaging tools & metadata from the virtualenv
 RUN rm -rf /opt/venv/lib/python3.11/site-packages/pip* \
            /opt/venv/lib/python3.11/site-packages/setuptools* \
+           /opt/venv/lib/python3.11/site-packages/_distutils_hack* \
+           /opt/venv/lib/python3.11/site-packages/distutils-precedence.pth \
            /opt/venv/lib/python3.11/site-packages/wheel* \
            /opt/venv/lib/python3.11/site-packages/jaraco* \
-           /opt/venv/bin/pip*
+           /opt/venv/bin/pip* \
+           /opt/venv/bin/wheel* \
+           /root/.cache
 
 # ==========================================
 # Stage 2: Hardened Minimal Distro Runtime
@@ -57,7 +61,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     HF_HOME=/opt/models/huggingface
 
-# FIX 3: Patch Debian libraries and purge global python base image packaging tools
+# 1. Update OS packages to the latest security point releases
+# 2. Scrub pre-installed packaging metadata from the global Python install
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get autoremove -y && \
@@ -67,16 +72,20 @@ RUN apt-get update && \
            /usr/local/lib/python3.11/site-packages/setuptools* \
            /usr/local/lib/python3.11/site-packages/wheel* \
            /usr/local/lib/python3.11/site-packages/jaraco* \
+           /usr/local/lib/python3.11/site-packages/_distutils_hack* \
+           /usr/local/lib/python3.11/site-packages/distutils-precedence.pth \
+           /usr/local/lib/python3.11/ensurepip \
            /usr/local/bin/pip* \
-           /usr/local/bin/wheel*
+           /usr/local/bin/wheel* \
+           /root/.cache
 
-# Dedicated unprivileged user/group (UID/GID 10001)
+# Dedicated unprivileged service user and group (UID/GID 10001)
 RUN groupadd -g 10001 appgroup && \
     useradd -u 10001 -g appgroup -s /sbin/nologin -M appuser
 
 WORKDIR /app
 
-# Copy virtual environment and model cache using explicit numeric IDs
+# Copy isolated virtual environment and pre-cached models
 COPY --from=builder --chown=10001:10001 /opt/venv /opt/venv
 COPY --from=builder --chown=10001:10001 /opt/models /opt/models
 
