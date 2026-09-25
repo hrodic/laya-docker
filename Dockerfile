@@ -59,7 +59,10 @@ LABEL org.opencontainers.image.title="laya-decision-service" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
-    HF_HOME=/opt/models/huggingface
+    HF_HOME=/opt/models/huggingface \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
 
 # 1. Update OS packages to the latest security point releases
 # 2. Scrub pre-installed packaging metadata from the global Python install
