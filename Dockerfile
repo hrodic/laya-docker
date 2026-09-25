@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Create virtual environment and upgrade core packaging tools immediately
+# Create virtual environment and upgrade core tools for clean compilation
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip setuptools wheel
@@ -28,16 +28,22 @@ RUN if [ -z "$LAYA_VERSION" ]; then \
         pip install --no-cache-dir "laya==${LAYA_VERSION}" onnxruntime uvicorn fastapi; \
     fi
 
-# Pre-download and cache all sub-checkpoints for 100% standalone execution
+# FIX 1: Pre-download 100% of the repository (all subfolders & checkpoints)
+# Eliminates all runtime Hugging Face downloads without executing model code
 RUN mkdir -p /opt/models/huggingface
 ENV HF_HOME=/opt/models/huggingface
-RUN python -c "from laya import Router; r = Router(); r.predict(state='warmup', questions={'q': {'type': 'noul', 'instructions': 'warmup'}})"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='convaiinnovations/laya')"
 
-# REMEDIATION: Strip build-only tooling from the venv so scanners don't flag them
-RUN pip uninstall -y pip setuptools wheel jaraco.context 2>/dev/null || true
+# FIX 2: Strip packaging tooling and build artifacts from virtualenv
+RUN pip uninstall -y pip setuptools wheel 2>/dev/null || true
+RUN rm -rf /opt/venv/lib/python3.11/site-packages/pip* \
+           /opt/venv/lib/python3.11/site-packages/setuptools* \
+           /opt/venv/lib/python3.11/site-packages/wheel* \
+           /opt/venv/lib/python3.11/site-packages/jaraco* \
+           /opt/venv/bin/pip*
 
 # ==========================================
-# Stage 2: Minimal Distro Runtime
+# Stage 2: Hardened Minimal Distro Runtime
 # ==========================================
 FROM python:3.11-slim AS runner
 
@@ -51,20 +57,26 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     HF_HOME=/opt/models/huggingface
 
-# REMEDIATION: Patch Debian base packages (resolves zlib and perl CVEs)
+# FIX 3: Patch Debian libraries and purge global python base image packaging tools
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get autoremove -y && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+           /usr/local/lib/python3.11/site-packages/pip* \
+           /usr/local/lib/python3.11/site-packages/setuptools* \
+           /usr/local/lib/python3.11/site-packages/wheel* \
+           /usr/local/lib/python3.11/site-packages/jaraco* \
+           /usr/local/bin/pip* \
+           /usr/local/bin/wheel*
 
-# Dedicated unprivileged user/group
+# Dedicated unprivileged user/group (UID/GID 10001)
 RUN groupadd -g 10001 appgroup && \
     useradd -u 10001 -g appgroup -s /sbin/nologin -M appuser
 
 WORKDIR /app
 
-# Copy virtual environment and model cache
+# Copy virtual environment and model cache using explicit numeric IDs
 COPY --from=builder --chown=10001:10001 /opt/venv /opt/venv
 COPY --from=builder --chown=10001:10001 /opt/models /opt/models
 
@@ -72,6 +84,7 @@ USER 10001:10001
 
 EXPOSE 8000
 
+# Zero-dependency Python healthcheck bound to the verified /health route
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')" || exit 1
 
