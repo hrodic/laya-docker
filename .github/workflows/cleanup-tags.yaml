@@ -1,0 +1,234 @@
+name: Prune Docker Hub Tags
+
+'on':
+  schedule:
+    # Runs every 12 hours (00:00, 12:00 UTC)
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry Run (simulate decisions without deleting)'
+        type: boolean
+        required: true
+        default: false
+      keep_minors:
+        description: 'Number of minor tags (X.Y) to retain'
+        type: string
+        required: true
+        default: '5'
+      keep_patches:
+        description: 'Number of patch tags (X.Y.Z) to retain'
+        type: string
+        required: true
+        default: '3'
+
+permissions:
+  contents: read
+
+jobs:
+  prune-dockerhub-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Evaluate and Prune Docker Hub Tags
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPOSITORY: 'laya-service'
+          KEEP_MINORS: ${{ inputs.keep_minors }}
+          KEEP_PATCHES: ${{ inputs.keep_patches }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python - << 'EOF'
+          import os
+          import sys
+          import json
+          import re
+          import time
+          import urllib.request
+          import urllib.error
+
+          username = os.environ.get("DOCKERHUB_USERNAME", "").strip()
+          token_secret = os.environ.get("DOCKERHUB_TOKEN", "").strip()
+          repo_name = os.environ.get("REPOSITORY", "laya-service").strip()
+
+          # Safely handle empty string inputs when triggered by cron schedule
+          raw_minors = os.environ.get("KEEP_MINORS", "").strip()
+          keep_minors_count = int(raw_minors) if raw_minors else 5
+
+          raw_patches = os.environ.get("KEEP_PATCHES", "").strip()
+          keep_patches_count = int(raw_patches) if raw_patches else 3
+
+          raw_dry = os.environ.get("DRY_RUN", "").strip().lower()
+          dry_run = raw_dry in ("true", "1", "yes")
+
+          if not username or not token_secret:
+              print("::error::Missing DOCKERHUB_USERNAME or DOCKERHUB_TOKEN secret.")
+              sys.exit(1)
+
+          # Force lowercase username for Docker namespace rules
+          namespace = username.lower()
+
+          # 1. Authenticate against Docker Hub
+          print(f"Authenticating as {namespace}...")
+          login_url = "https://hub.docker.com/v2/users/login/"
+          login_payload = json.dumps({"username": username, "password": token_secret}).encode("utf-8")
+          login_req = urllib.request.Request(
+              login_url,
+              data=login_payload,
+              headers={"Content-Type": "application/json", "User-Agent": "GitHubActions-Pruner"}
+          )
+
+          try:
+              with urllib.request.urlopen(login_req, timeout=10) as resp:
+                  jwt_token = json.loads(resp.read().decode())["token"]
+          except Exception as e:
+              print(f"::error::Authentication failed: {e}")
+              sys.exit(1)
+
+          headers = {
+              "Authorization": f"Bearer {jwt_token}",
+              "Accept": "application/json",
+              "User-Agent": "GitHubActions-Pruner"
+          }
+
+          # 2. Fetch all tags with pagination handling
+          tags = []
+          url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo_name}/tags/?page_size=100"
+
+          print(f"Fetching tags for {namespace}/{repo_name}...")
+          while url:
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      data = json.loads(resp.read().decode())
+                      tags.extend([item["name"] for item in data.get("results", [])])
+                      url = data.get("next")
+              except Exception as e:
+                  print(f"::error::Failed to fetch tag page: {e}")
+                  sys.exit(1)
+
+          print(f"Discovered {len(tags)} total tags on Docker Hub.")
+
+          # 3. Categorize tags
+          patch_regex = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+          minor_regex = re.compile(r"^v?(\d+)\.(\d+)$")
+          major_regex = re.compile(r"^v?(\d+)$")
+
+          patch_tags = []   # tuple: ((major, minor, patch), raw_tag)
+          minor_tags = []   # tuple: ((major, minor), raw_tag)
+          protected_tags = []
+
+          for tag in tags:
+              # Explicitly protect latest
+              if tag == "latest":
+                  protected_tags.append((tag, "Default release alias (:latest)"))
+                  continue
+
+              # Explicitly protect single-integer major tags (e.g. 1, v1)
+              major_match = major_regex.match(tag)
+              if major_match:
+                  protected_tags.append((tag, "Major release alias"))
+                  continue
+
+              # Check patch tags (X.Y.Z)
+              patch_match = patch_regex.match(tag)
+              if patch_match:
+                  version_key = tuple(int(x) for x in patch_match.groups())
+                  patch_tags.append((version_key, tag))
+                  continue
+
+              # Check minor tags (X.Y)
+              minor_match = minor_regex.match(tag)
+              if minor_match:
+                  version_key = tuple(int(x) for x in minor_match.groups())
+                  minor_tags.append((version_key, tag))
+                  continue
+
+              # Any unrecognized custom tag is preserved defensively
+              protected_tags.append((tag, "Non-SemVer / Custom alias"))
+
+          # 4. Sort SemVer tags in descending order (highest/newest first)
+          patch_tags.sort(key=lambda item: item[0], reverse=True)
+          minor_tags.sort(key=lambda item: item[0], reverse=True)
+
+          # 5. Determine retention sets
+          kept_patches = patch_tags[:keep_patches_count]
+          pruned_patches = patch_tags[keep_patches_count:]
+
+          kept_minors = minor_tags[:keep_minors_count]
+          pruned_minors = minor_tags[keep_minors_count:]
+
+          # Display audit breakdown
+          print("\n" + "=" * 55)
+          print("TAG AUDIT BREAKDOWN")
+          print("=" * 55)
+          print(f"[PROTECTED] (Never deleted - Count: {len(protected_tags)}):")
+          for tag, reason in protected_tags:
+              print(f"  • {tag:<15} ({reason})")
+
+          print(f"\n[MINOR VERSIONS] (Retaining top {keep_minors_count}):")
+          print("  Preserved:")
+          for _, tag in kept_minors:
+              print(f"    ✓ {tag}")
+          if pruned_minors:
+              print("  Scheduled for deletion:")
+              for _, tag in pruned_minors:
+                  print(f"    ✗ {tag}")
+          else:
+              print("    (No stale minor tags found)")
+
+          print(f"\n[PATCH VERSIONS] (Retaining top {keep_patches_count}):")
+          print("  Preserved:")
+          for _, tag in kept_patches:
+              print(f"    ✓ {tag}")
+          if pruned_patches:
+              print("  Scheduled for deletion:")
+              for _, tag in pruned_patches:
+                  print(f"    ✗ {tag}")
+          else:
+              print("    (No stale patch tags found)")
+
+          tags_to_delete = [tag for _, tag in pruned_minors] + [tag for _, tag in pruned_patches]
+
+          print("\n" + "=" * 55)
+          if dry_run:
+              print(f"DRY RUN ENABLED: {len(tags_to_delete)} tags would be pruned.")
+              for tag in tags_to_delete:
+                  print(f"  [WOULD DELETE] {namespace}/{repo_name}:{tag}")
+              sys.exit(0)
+
+          if not tags_to_delete:
+              print("Registry already meets retention criteria. Zero tags to prune.")
+              sys.exit(0)
+
+          print(f"PRUNING {len(tags_to_delete)} STALE TAGS...")
+          errors = 0
+          for tag in tags_to_delete:
+              delete_url = f"https://hub.docker.com/v2/repositories/{namespace}/{repo_name}/tags/{tag}/"
+              req = urllib.request.Request(delete_url, method="DELETE", headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      if resp.status in (200, 202, 204):
+                          print(f"  ✓ Deleted tag: {tag}")
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      print(f"  - Tag already missing (404): {tag}")
+                  else:
+                      print(f"  ✗ Failed to delete {tag}: HTTP {e.code}")
+                      errors += 1
+              except Exception as e:
+                  print(f"  ✗ Failed to delete {tag}: {e}")
+                  errors += 1
+              time.sleep(0.3)  # Gentle spacing to respect registry rate limits
+
+          print("=" * 55)
+          if errors > 0:
+              print(f"::warning::Completed with {errors} deletion error(s).")
+          else:
+              print("Retention policy successfully applied.")
+          EOF
