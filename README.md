@@ -19,7 +19,7 @@ This image packages complete model weights and runs in **100% air-gapped environ
 - **Sub-150ms CPU Execution:** Powered by `onnxruntime` for fast matrix math on edge hardware and standard developer laptops without requiring a GPU.
 - **Zero Token Generation Overhead:** Evaluates direct logit classification heads (`output_tokens: 0`), preventing prompt-injection loops and non-deterministic text generation.
 - **CNCF-Compliant Hardening:** Built as a multi-stage distroless-style container running under an unprivileged user (`UID: 10001`). Stripped of build tools (`pip`, `setuptools`, `wheel`) to eliminate scanner vulnerabilities.
-- **Automated SemVer CI/CD:** Integrated GitHub Actions workflow that detects PyPI releases and publishes synchronized SemVer tags to Docker Hub.
+- **Autonomous Release Sync & CI/CD:** Scheduled GitHub Actions watchers monitor upstream releases (`NandhaKishorM/laya`) and automatically build, tag, and publish synchronized multi-tier SemVer releases to Docker Hub with zero manual intervention.
 
 ---
 
@@ -182,6 +182,123 @@ curl -X POST http://localhost:8000/v1/systemone \
 }
 ```
 
+## Production Example: Automated SRE Incident Triage
+
+Demonstrating a multi-task evaluation for automated deployment rollback decisions (`choice`, `noul`, and `score`) in a single forward pass:
+
+### Request
+
+```bash
+curl -X POST http://localhost:8000/v1/systemone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "state": "Incident Alert [SEV-2]: Canary deployment v2.14.0 in us-east-1 is failing live customer checkout transactions with error rates at 14.8%, breaching the 5% rollback threshold. Diagnostic analysis reveals an unindexed foreign-key migration locked the primary orders table, causing PostgreSQL connection pool exhaustion and 4,800ms query latency. Ingress proxies are returning 504 timeouts because container threads are blocked waiting for database connections.",
+    "questions": {
+      "root_cause_domain": {
+        "type": "choice",
+        "instructions": "Identify the primary architectural layer causing the failure cascade",
+        "criteria": {
+          "database": "Database table locks, unindexed schema migrations, or connection pool exhaustion",
+          "network": "DNS failures, edge routing, internet transit, or load balancer faults",
+          "application_code": "Memory leaks, unhandled code exceptions, or container crash loops",
+          "third_party": "External vendor APIs or upstream payment gateway outages"
+        }
+      },
+      "abort_canary_pipeline": {
+        "type": "noul",
+        "instructions": "Should the orchestrator execute an immediate automated canary abort due to error budget breach?"
+      },
+      "severity_tier": {
+        "type": "score",
+        "instructions": "Classify the operational severity tier based on business impact and blast radius",
+        "criteria": [
+          "Tier 0: Non-customer facing metric drift with no error budget impact",
+          "Tier 1: Degraded non-critical auxiliary features with payment paths unaffected",
+          "Tier 2: Active customer checkout failures contained within a canary deployment cohort",
+          "Tier 3: Total global infrastructure outage affecting all production regions simultaneously"
+        ]
+      }
+    }
+  }'
+```
+
+### Response
+
+```json
+{
+  "model": "laya-rl-agent",
+  "answers": {
+    "root_cause_domain": {
+      "type": "choice",
+      "choice": "database",
+      "probabilities": {
+        "database": 0.8536,
+        "network": 0.0305,
+        "application_code": 0.0797,
+        "third_party": 0.0362
+      },
+      "confidence": 0.5937,
+      "answer_confidence": 0.8536,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "abort_canary_pipeline": {
+      "type": "noul",
+      "noul": 0.9954,
+      "confidence": 0.9954,
+      "answer_confidence": 0.9954,
+      "action": {
+        "act_probability": 1.0
+      }
+    },
+    "severity_tier": {
+      "type": "score",
+      "score": 1.9693,
+      "legend": {
+        "0": "Tier 0: Non-customer facing metric drift with no error budget impact",
+        "1": "Tier 1: Degraded non-critical auxiliary features with payment paths unaffected",
+        "2": "Tier 2: Active customer checkout failures contained within a canary deployment cohort",
+        "3": "Tier 3: Total global infrastructure outage affecting all production regions simultaneously"
+      },
+      "probabilities": {
+        "0": 0.0072,
+        "1": 0.04,
+        "2": 0.9289,
+        "3": 0.0238
+      },
+      "confidence": 0.7677,
+      "answer_confidence": 0.9289,
+      "action": {
+        "act_probability": 1.0
+      }
+    }
+  },
+  "usage": {
+    "input_tokens": 512,
+    "output_tokens": 0
+  },
+  "routing": {
+    "model": "english",
+    "repo": "convaiinnovations/laya",
+    "reason": "English Latin text",
+    "detection": {
+      "script": "latin",
+      "script_profile": {
+        "latin": 1.0
+      },
+      "language": "en",
+      "is_english": true,
+      "language_undecided": false,
+      "diacritic_rate": 0.0,
+      "non_latin_fraction": 0.0
+    },
+    "workflow": null
+  }
+}
+```
+
+
 ---
 
 ## Security & Hardening
@@ -221,16 +338,32 @@ docker inspect --format='{{json .State.Health.Status}}' laya
 
 ---
 
-## Automated CI/CD Pipeline
+## Automated CI/CD & Autonomous Release Sync
 
-The `.github/workflows/docker-publish.yml` workflow automates the container release lifecycle:
+The repository uses a decoupled, dual-workflow architecture to automate container releases and track upstream updates:
 
-1. **Version Resolution:** Queries the PyPI JSON API on push to `main` to identify the latest released version of `laya`.
-2. **Semantic Tagging:** Builds multi-tier tags (`:MAJOR.MINOR.PATCH`, `:MAJOR.MINOR`, and `:latest`).
-3. **Registry Publication:** Pushes signed, verified builds to Docker Hub with GitHub Actions layer caching.
+### 1. Upstream Watcher (`.github/workflows/check-upstream.yml`)
+Runs on a scheduled cron cadence (every 4–6 hours) or via manual dispatch:
+1. **Upstream Detection:** Queries GitHub Releases (`NandhaKishorM/laya`) with an automated fallback to the PyPI JSON API.
+2. **Registry Delta Check:** Inspects Docker Hub's public API to determine if the detected tag already exists for `hrodicus/laya-service`.
+3. **Automated Dispatch:** If a new release is detected, it triggers `docker-publish.yml` via the GitHub CLI (`gh workflow run`) with the target version. If the tag already exists, the job exits cleanly in seconds.
 
-### Required Repository Secrets
+### 2. Builder & Publisher (`.github/workflows/docker-publish.yml`)
+Triggers automatically on code pushes to `master`, via the upstream watcher, or through manual `workflow_dispatch`:
+1. **SemVer Resolution:** Resolves the exact SemVer tag from inputs or PyPI metadata.
+2. **Multi-Tier Tagging:** Builds and tags `:MAJOR.MINOR.PATCH`, `:MAJOR.MINOR`, and `:latest` concurrently.
+3. **Layer-Cached Publication:** Compiles the air-gapped image and pushes signed layers to Docker Hub utilizing GitHub Actions cache (`type=gha`).
 
-Configure these under **Settings > Secrets and variables > Actions**:
-- `DOCKERHUB_USERNAME`: Your Docker Hub registry username.
-- `DOCKERHUB_TOKEN`: Personal Access Token with read/write access.
+---
+
+### Required Repository Configuration
+
+1. **Docker Hub Secrets:**  
+   Configure under **Settings > Secrets and variables > Actions**:
+   - `DOCKERHUB_USERNAME`: Your Docker Hub registry username.
+   - `DOCKERHUB_TOKEN`: Personal Access Token with read/write permissions.
+
+2. **Workflow Permissions:**  
+   To allow the upstream watcher to trigger the builder workflow, configure under **Settings > Actions > General > Workflow permissions**:
+   - Select **Read and write permissions**.
+   - Check **Allow GitHub Actions to create and approve pull requests** (if prompted) and save.

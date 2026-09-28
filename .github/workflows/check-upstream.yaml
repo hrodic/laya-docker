@@ -1,0 +1,89 @@
+name: Check Upstream Laya Releases
+
+'on':
+  schedule:
+    # Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write # Required for GITHUB_TOKEN to trigger docker-publish.yml
+  contents: read
+
+jobs:
+  check-and-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Inspect Upstream Release and Compare Tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_REPO: 'hrodicus/laya-service'
+        run: |
+          echo "Checking latest release on GitHub (NandhaKishorM/laya)..."
+
+          # 1. Fetch latest release tag using GH_TOKEN to avoid runner IP rate-limiting
+          UPSTREAM_VERSION=$(python -c "
+          import urllib.request, json, re, os
+          gh_token = os.environ.get('GH_TOKEN', '')
+          headers = {'User-Agent': 'Mozilla/5.0'}
+          if gh_token:
+              headers['Authorization'] = f'Bearer {gh_token}'
+          try:
+              req = urllib.request.Request(
+                  'https://api.github.com/repos/NandhaKishorM/laya/releases/latest',
+                  headers=headers
+              )
+              with urllib.request.urlopen(req, timeout=5) as res:
+                  data = json.loads(res.read())
+                  tag = data.get('tag_name', '')
+                  match = re.search(r'[0-9]+\.[0-9]+(\.[0-9]+)?', tag)
+                  if match:
+                      print(match.group(0))
+          except Exception:
+              exit(1)
+          " 2>/dev/null || echo "")
+
+          # Fallback to PyPI if GitHub releases are untagged or unavailable
+          if [ -z "$UPSTREAM_VERSION" ]; then
+            echo "GitHub API release not found. Querying PyPI..."
+            UPSTREAM_VERSION=$(python -c "
+            import urllib.request, json
+            try:
+                req = urllib.request.Request('https://pypi.org/pypi/laya/json', headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as res:
+                    data = json.loads(res.read())
+                    print(data['info']['version'])
+            except Exception:
+                exit(1)
+            " 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$UPSTREAM_VERSION" ]; then
+            echo "ERROR: Could not resolve upstream version from GitHub or PyPI."
+            exit 1
+          fi
+
+          echo "Target upstream version: $UPSTREAM_VERSION"
+
+          # 2. Check if the tag already exists in Docker Hub
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/${UPSTREAM_VERSION}/")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Tag ${DOCKERHUB_REPO}:${UPSTREAM_VERSION} already exists on Docker Hub. Service is up to date."
+            exit 0
+          fi
+
+          # 3. Dispatch the build workflow
+          echo "Tag ${DOCKERHUB_REPO}:${UPSTREAM_VERSION} missing on Docker Hub."
+          echo "Triggering docker-publish.yml for version ${UPSTREAM_VERSION}..."
+
+          gh workflow run docker-publish.yml --ref master -f laya_version="${UPSTREAM_VERSION}"
+          echo "Build workflow triggered successfully."
