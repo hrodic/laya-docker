@@ -7,7 +7,7 @@ name: Check Upstream Laya Releases
   workflow_dispatch:
 
 permissions:
-  actions: write # Required for GITHUB_TOKEN to trigger docker-publish.yml
+  actions: write # Required for GITHUB_TOKEN to trigger docker-publish.yaml
   contents: read
 
 jobs:
@@ -83,7 +83,7 @@ jobs:
 
           # 3. Dispatch the build workflow
           echo "Tag ${DOCKERHUB_REPO}:${UPSTREAM_VERSION} missing on Docker Hub."
-          echo "Triggering docker-publish.yml for version ${UPSTREAM_VERSION}..."
+          echo "Triggering docker-publish.yaml for version ${UPSTREAM_VERSION}..."
 
-          gh workflow run docker-publish.yml --ref master -f laya_version="${UPSTREAM_VERSION}"
+          gh workflow run docker-publish.yaml --ref master -f laya_version="${UPSTREAM_VERSION}"
           echo "Build workflow triggered successfully."
